@@ -1,0 +1,224 @@
+/*
+ * Copyright 2013-2026 the HotswapAgent authors.
+ *
+ * This file is part of HotswapAgent.
+ *
+ * HotswapAgent is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 2 of the License, or (at your
+ * option) any later version.
+ *
+ * HotswapAgent is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+ * Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with HotswapAgent. If not, see http://www.gnu.org/licenses/.
+ */
+package org.hotswap.agent.plugin.jvm;
+
+import java.io.IOException;
+import java.lang.reflect.Field;
+import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.List;
+
+import org.hotswap.agent.annotation.LoadEvent;
+import org.hotswap.agent.annotation.OnClassLoadEvent;
+import org.hotswap.agent.annotation.Plugin;
+import org.hotswap.agent.command.Command;
+import org.hotswap.agent.config.PluginManager;
+import org.hotswap.agent.javassist.CannotCompileException;
+import org.hotswap.agent.javassist.CtClass;
+import org.hotswap.agent.javassist.CtConstructor;
+import org.hotswap.agent.javassist.CtField;
+import org.hotswap.agent.javassist.CtMethod;
+import org.hotswap.agent.javassist.Modifier;
+import org.hotswap.agent.javassist.NotFoundException;
+import org.hotswap.agent.javassist.expr.ExprEditor;
+import org.hotswap.agent.javassist.expr.FieldAccess;
+import org.hotswap.agent.logging.AgentLogger;
+
+/**
+ * ClassInitPlugin initializes static (class) variables after class redefinition. Initializes new enumeration values.
+ *
+ * @author Vladimir Dvorak
+ */
+@Plugin(name = "ClassInitPlugin",
+        description = "Initialize empty static fields (left by DCEVM) using code from <clinit> method.",
+        testedVersions = {"DCEVM"})
+public class ClassInitPlugin {
+
+    private static AgentLogger LOGGER = AgentLogger.getLogger(ClassInitPlugin.class);
+
+    private static final String HOTSWAP_AGENT_CLINIT_METHOD = "$$ha$clinit";
+
+    public static boolean reloadFlag;
+
+    @OnClassLoadEvent(classNameRegexp = ".*", events = LoadEvent.REDEFINE)
+    public static void patch(final CtClass ctClass, final ClassLoader classLoader, final Class<?> originalClass) throws IOException, CannotCompileException, NotFoundException {
+
+        if (isSyntheticClass(originalClass)) {
+            return;
+        }
+
+        final String className = ctClass.getName();
+
+        try {
+            CtMethod origMethod = ctClass.getDeclaredMethod(HOTSWAP_AGENT_CLINIT_METHOD);
+            ctClass.removeMethod(origMethod);
+        } catch (org.hotswap.agent.javassist.NotFoundException ex) {
+            // swallow
+        }
+
+        final boolean enumReordered = isEnumReordered(ctClass, originalClass);
+        if (enumReordered) {
+            LOGGER.debug("Enum order changed for {} -> will reinitialize enum constant fields.", className);
+        }
+
+        CtConstructor clinit = ctClass.getClassInitializer();
+
+        if (clinit != null) {
+            LOGGER.debug("Adding " + HOTSWAP_AGENT_CLINIT_METHOD + " to class: {}", className);
+            CtConstructor haClinit = new CtConstructor(clinit, ctClass, null);
+            haClinit.getMethodInfo().setName(HOTSWAP_AGENT_CLINIT_METHOD);
+            haClinit.setModifiers(Modifier.PUBLIC | Modifier.STATIC);
+            ctClass.addConstructor(haClinit);
+
+            final boolean reinitializeStatics[] = new boolean[] { false };
+
+            haClinit.instrument(
+                new ExprEditor() {
+                    public void edit(FieldAccess f) throws CannotCompileException {
+                        try {
+                            if (f.isStatic() && f.isWriter()) {
+                                Field originalField = null;
+                                try {
+                                    originalField = originalClass.getDeclaredField(f.getFieldName());
+                                } catch (NoSuchFieldException e) {
+                                    LOGGER.debug("New field will be initialized {}", f.getFieldName());
+                                    reinitializeStatics[0] = true;
+                                }
+                                if (originalField != null) {
+                                    // Enum class contains an array field, in javac it's name starts with $VALUES,
+                                    // in eclipse compiler starts with ENUM$VALUES
+                                    if (originalClass.isEnum() && f.getSignature().startsWith("[L")
+                                            && (f.getFieldName().startsWith("$VALUES")
+                                                || f.getFieldName().startsWith("ENUM$VALUES"))) {
+                                        if (reinitializeStatics[0]) {
+                                            LOGGER.debug("New field will be initialized {}", f.getFieldName());
+                                        } else {
+                                            if (enumReordered) {
+                                                reinitializeStatics[0] = true;
+                                            } else {
+                                                reinitializeStatics[0] = checkOldEnumValues(ctClass, originalClass);
+                                            }
+                                        }
+                                    } else {
+                                        if (!originalField.isEnumConstant() || !enumReordered) {
+                                            LOGGER.debug("Skipping old field {}", f.getFieldName());
+                                            f.replace("{}");
+                                        }
+                                    }
+                                }
+                            }
+                        } catch (Exception e) {
+                            LOGGER.error("Patching " + HOTSWAP_AGENT_CLINIT_METHOD + " method failed.", e);
+                        }
+                    }
+
+                }
+            );
+
+            if (reinitializeStatics[0]) {
+                PluginManager.getInstance().getScheduler().scheduleCommandOnClassesRedefinedOrTimeout(new Command() {
+                    @Override
+                    public void executeCommand() {
+                        try {
+                            Class<?> clazz = classLoader.loadClass(className);
+                            Method m = clazz.getDeclaredMethod(HOTSWAP_AGENT_CLINIT_METHOD, new Class[] {});
+                            if (m != null) {
+                                m.setAccessible(true);
+                                m.invoke(null, new Object[] {});
+                                LOGGER.debug("Initializer {} invoked for class {}", HOTSWAP_AGENT_CLINIT_METHOD, className);
+                            } else {
+                                LOGGER.error("Class initializer {} not found", HOTSWAP_AGENT_CLINIT_METHOD);
+                            }
+                        } catch (Exception e) {
+                            LOGGER.error("Error initializing redefined class {}", e, className);
+                        } finally {
+                            reloadFlag = false;
+                        }
+                    }
+                }, 150); // Hack : init must be called after dependant class redefinition. Since the class can
+                         // be proxied, the class init must be scheduled after proxy redefinition. Currently proxy
+                         // redefinition (in ProxyPlugin) is scheduled with 100ms delay, therefore we use delay 150ms.
+            } else {
+                reloadFlag = false;
+            }
+        }
+    }
+
+    private static boolean checkOldEnumValues(CtClass ctClass, Class<?> originalClass) {
+        if (ctClass.isEnum()) {
+            // Check if some field from original enumeration was deleted
+            Enum<?>[] enumConstants = (Enum<?>[]) originalClass.getEnumConstants();
+            for (Enum<?> en : enumConstants) {
+                try {
+                    CtField existing = ctClass.getDeclaredField(en.toString());
+                } catch (NotFoundException e) {
+                    LOGGER.debug("Enum field deleted. $VALUES will be reinitialized {}", en.toString());
+                    return true;
+                }
+            }
+        } else {
+            LOGGER.error("Patching " + HOTSWAP_AGENT_CLINIT_METHOD + " method failed. Enum type expected {}", ctClass.getName());
+        }
+        return false;
+    }
+
+    private static boolean isEnumReordered(CtClass ctClass, Class<?> originalClass) {
+        if (!ctClass.isEnum() || originalClass == null || !originalClass.isEnum()) {
+            return false;
+        }
+
+        // Old order from runtime (original class)
+        Enum<?>[] oldConsts = (Enum<?>[]) originalClass.getEnumConstants();
+        List<String> oldOrder = new ArrayList<>();
+        for (Enum<?> e : oldConsts) {
+            oldOrder.add(e.name());
+        }
+
+        List<String> newOrder = new ArrayList<>();
+        try {
+            for (CtField f : ctClass.getDeclaredFields()) {
+                int mod = f.getModifiers();
+                boolean looksLikeConst = Modifier.isStatic(mod) && Modifier.isFinal(mod) && f.getType().getName().equals(ctClass.getName());
+                if (looksLikeConst) {
+                    newOrder.add(f.getName());
+                }
+            }
+        } catch (NotFoundException ex) {
+            return true;
+        }
+
+        for (int i = 0; i < newOrder.size() && i < oldOrder.size(); i++) {
+            if (!newOrder.get(i).equals(oldOrder.get(i))) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+
+    private static boolean isSyntheticClass(Class<?> classBeingRedefined) {
+        return classBeingRedefined.getSimpleName().contains("$$_javassist")
+                || classBeingRedefined.getSimpleName().contains("$$_jvst")
+                || classBeingRedefined.getName().startsWith("com.sun.proxy.$Proxy")
+                || classBeingRedefined.getSimpleName().contains("$$");
+    }
+
+
+}

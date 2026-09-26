@@ -1,0 +1,13 @@
+#Eclipse
+**/.settings
+**/.project
+**/.classpath
+**/target
+
+#IntelliJ
+.DS_Store
+*.idea
+*.iml
+pom.xml.releaseBackup
+
+.flattened-pom.xml

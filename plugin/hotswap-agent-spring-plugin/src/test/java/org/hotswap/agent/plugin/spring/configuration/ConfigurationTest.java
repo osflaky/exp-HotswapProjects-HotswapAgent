@@ -1,0 +1,116 @@
+/*
+ * Copyright 2013-2026 the HotswapAgent authors.
+ *
+ * This file is part of HotswapAgent.
+ *
+ * HotswapAgent is free software: you can redistribute it and/or modify it
+ * under the terms of the GNU General Public License as published by the
+ * Free Software Foundation, either version 2 of the License, or (at your
+ * option) any later version.
+ *
+ * HotswapAgent is distributed in the hope that it will be useful, but
+ * WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU General
+ * Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License along
+ * with HotswapAgent. If not, see http://www.gnu.org/licenses/.
+ */
+package org.hotswap.agent.plugin.spring.configuration;
+
+import org.hotswap.agent.javassist.ClassPool;
+import org.hotswap.agent.javassist.CtClass;
+import org.hotswap.agent.javassist.LoaderClassPath;
+import org.hotswap.agent.plugin.spring.BaseTestUtil;
+import org.hotswap.agent.plugin.spring.configuration.beans.Config;
+import org.hotswap.agent.plugin.spring.configuration.beans.scan.Configurations;
+import org.hotswap.agent.plugin.spring.configuration.configs.Config1;
+import org.hotswap.agent.plugin.spring.configuration.configs.Config2;
+import org.hotswap.agent.plugin.spring.configuration.configs.Config3;
+import org.hotswap.agent.plugin.spring.reload.SpringChangedAgent;
+import org.junit.After;
+import org.junit.Before;
+import org.junit.Test;
+import org.junit.runner.RunWith;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.support.DefaultListableBeanFactory;
+import org.springframework.context.support.AbstractApplicationContext;
+import org.springframework.core.io.ClassPathResource;
+import org.springframework.core.io.Resource;
+import org.springframework.test.context.ContextConfiguration;
+import org.springframework.test.context.junit4.SpringJUnit4ClassRunner;
+
+import java.io.ByteArrayInputStream;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+
+@RunWith(SpringJUnit4ClassRunner.class)
+@ContextConfiguration(classes = {Config.class, Configurations.class})
+public class ConfigurationTest {
+    @Autowired
+    private AbstractApplicationContext context;
+
+    private static final Resource config = new ClassPathResource(Config.class.getName().replace('.', '/') + ".class");
+
+    @Before
+    public void before() {
+        BaseTestUtil.configMaxReloadTimes();
+        SpringChangedAgent.getInstance((DefaultListableBeanFactory) context.getBeanFactory());
+    }
+
+    @After
+    public void after() {
+        SpringChangedAgent.destroyBeanFactory((DefaultListableBeanFactory) context.getBeanFactory());
+    }
+
+    @Test
+    public void swapConfigClass() throws Exception {
+        System.out.println("ConfigurationTest.swapConfigClass." + context.getBeanFactory());
+        ClassPool classPool = new ClassPool();
+        classPool.appendClassPath(new LoaderClassPath(Config.class.getClassLoader()));
+        byte[] origClassBytes = classPool.getCtClass(Config.class.getName()).toBytecode();
+        try {
+            int reloadTimes = 1;
+            // Config1.class -> Config.class
+            replaceConfig(Config1.class, reloadTimes++);
+            assertTrue(context.containsBean("a"));
+            assertTrue(context.containsBean("b"));
+            assertFalse(context.containsBean("c"));
+            assertFalse(context.containsBean("A"));
+
+            // Config2.class -> Config1.class
+            replaceConfig(Config2.class, reloadTimes++);
+            assertTrue(context.containsBean("a"));
+            assertTrue(context.containsBean("c"));
+            assertFalse(context.containsBean("b"));
+            assertFalse(context.containsBean("A"));
+
+            // Config3.class -> Config2.class
+            replaceConfig(Config3.class, reloadTimes++);
+            assertTrue(context.containsBean("A"));
+            assertFalse(context.containsBean("a"));
+            assertFalse(context.containsBean("b"));
+            assertFalse(context.containsBean("c"));
+        } finally {
+            // recover Config.class
+            Files.copy(new ByteArrayInputStream(origClassBytes), config.getFile().toPath(),
+                    StandardCopyOption.REPLACE_EXISTING);
+        }
+    }
+
+    private void replaceConfig(Class<?> swap, int reloadTimes) throws Exception {
+        ClassPool classPool = new ClassPool();
+        classPool.appendClassPath(new LoaderClassPath(Config.class.getClassLoader()));
+        CtClass ctClass = classPool.getAndRename(swap.getName(), Config.class.getName());
+
+        BaseTestUtil.setClassesForReload(Config.class);
+
+        Files.copy(new ByteArrayInputStream(ctClass.toBytecode()), config.getFile().toPath(),
+                StandardCopyOption.REPLACE_EXISTING);
+
+        BaseTestUtil.waitForClassReloadsToFinish();
+    }
+}
