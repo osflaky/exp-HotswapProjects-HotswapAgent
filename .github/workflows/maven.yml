@@ -1,0 +1,31 @@
+name: Java CI with Maven
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up DCEVM 11
+      run: |
+        curl -L -o jdk.tar.gz https://github.com/TravaOpenJDK/trava-jdk-11-dcevm/releases/download/dcevm-11.0.15%2B1/Openjdk11u-dcevm-linux-x64.tar.gz
+        tar -xzf jdk.tar.gz
+        export JAVA_HOME=$PWD/dcevm-11.0.15+1
+        export PATH=$JAVA_HOME/bin:$PATH
+        java -version
+      shell: bash
+
+    - name: Maven install
+      run: |
+        export JAVA_HOME=$PWD/dcevm-11.0.15+1
+        export PATH=$JAVA_HOME/bin:$PATH
+        java -version
+        mvn -B clean install
+      shell: bash
+    name: build [ubuntu-latest--x64]
+    timeout-minutes: 150
